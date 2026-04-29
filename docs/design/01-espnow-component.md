@@ -1,6 +1,6 @@
 # ESP-NOW External Component for ESP8266 — Design Document
 
-**Version:** 0.2  
+**Version:** 0.3  
 **Status:** Draft — open for discussion
 
 ---
@@ -200,11 +200,14 @@ This subsection is a living reference. Each entry documents a known divergence f
 ```
 components/espnow/
   __init__.py          # espnow: block — node identity, peer list, PMK, channel,
-                       # on_receive triggers, espnow.send and espnow.broadcast actions
-  switch.py            # espnow_sync declarative abstraction for switches
-  sensor.py            # espnow telemetry: publisher mixin and receiver platform
-  espnow_component.h
-  espnow_component.cpp
+                       # on_receive/on_broadcast/on_unknown_peer triggers,
+                       # espnow.send, espnow.broadcast, espnow.peer.add/delete actions
+  switch.py            # declarative layer for switches: implements espnow_sync,
+                       # which expands to flexible-layer send + on_receive handlers
+  sensor.py            # declarative layer for sensors: implements espnow_publish
+                       # mixin (sender side) and platform: espnow sensor (receiver side)
+  espnow_component.h   # ESPNowComponent class + Action/Trigger declarations
+  espnow_component.cpp # runtime: setup, loop dispatch, WiFi-task callback context
 ```
 
 The Python layer is responsible for config validation and C++ code generation. It does not contain runtime logic. The C++ layer contains all runtime behavior.
@@ -458,7 +461,7 @@ espnow:
   on_receive:
     address: sensor_node  # filter by source so other peers don't reset the timer
     then:
-      - binary_sensor.template.publish:
+      - binary_sensor.template.publish:  # standard ESPHome action for template binary sensors
           id: peer_alive
           state: true
       - script.execute: peer_timeout
@@ -538,7 +541,7 @@ Specific implications:
 - The receive queue is a fixed-size static ring buffer, not a dynamic container. Queue depth is configurable at compile time via `espnow_queue_depth:` in the YAML, with a sensible default (e.g., 8 frames).
 - Each queued frame stores up to 250 bytes of payload plus 6 bytes of source MAC. A queue depth of 8 costs 2 KB of static RAM. This is acceptable.
 - The peer list is stored in a static array (maximum 20 entries). No heap allocation for peer management.
-- The component should not use `std::string` for MAC addresses or topic identifiers in the hot path.
+- The component should not use `std::string` for MAC addresses in the hot path.
 
 ### 7.3 OTA Updates
 
@@ -561,7 +564,7 @@ The implementation uses a statically allocated ring buffer with an atomic write 
 ESP8266 has no JTAG. All debug output goes through UART. On Sonoff TX devices, UART0 (TX: GPIO1, RX: GPIO3) is typically the programming port and can be used for debug logging at runtime. UART1 (TX: GPIO2) is TX-only and available as an alternative log output.
 
 The component should emit log messages at appropriate levels:
-- `DEBUG`: successful sends, received frame metadata (topic, source MAC, length)
+- `DEBUG`: successful sends, received frame metadata (source MAC, length)
 - `WARN`: send failures, queue overflow
 - `ERROR`: initialization failures
 
@@ -615,7 +618,7 @@ If the device runs as a SoftAP, `channel: 0` should resolve to the SoftAP channe
 Items marked *deferred* are expected to appear in a future version. Items marked *out of scope* are unlikely to be implemented in this component at any version.
 
 **Topic-based routing (deferred to v2).**  
-A `topic:` field on `espnow.send`, `espnow.broadcast`, and the receive triggers, enabling message-type multiplexing on a single peer channel without payload-byte conventions. No v1 use case requires it — address-based filtering covers cases 1 and 2 cleanly. Deferred by the minimum scope principle. When added, it will be a purely additive change: v1 configurations remain valid, and the declarative layer will use topic routing internally without exposing it in YAML.
+A `topic:` field on `espnow.send`, `espnow.broadcast`, and the receive triggers, enabling message-type multiplexing on a single peer channel without payload-byte conventions. No v1 use case requires it — address-based filtering covers cases 1 and 2 cleanly. Deferred by the minimum scope principle. When added, it will be a purely additive change: v1 configurations remain valid, and the declarative layer will use topic routing internally without exposing it in YAML. The key distinction from the payload-byte convention used in Section 6.3's re-sync example is dispatch level: a topic field is matched by the component before any user handler runs, while a payload byte must be checked in a lambda inside every handler. Topic routing is therefore ergonomically superior when multiple message types flow between the same peers.
 
 **`espnow.set_channel` (deferred to v2).**  
 Explicit runtime channel switching, equivalent to the official component's `espnow.set_channel` action. No v1 use case requires manual channel changes — the default `channel: 0` behavior handles the common case. Deferred by minimum scope. Alignment with the official component is desirable but not sufficient justification for inclusion when no concrete problem is solved.
