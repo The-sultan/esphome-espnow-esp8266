@@ -198,17 +198,31 @@ The Python layer is responsible for config validation and C++ code generation. I
 ### 5.2 The Four Primitives
 
 **Primitive 1 — Node identity and peer list.**  
-Configured under the top-level `espnow:` key. Declares the node's PMK (optional), the channel policy (explicit channel or inherit from `wifi:`), and the list of peers with their MAC addresses and optional LMKs. This primitive has no runtime behavior on its own — it is configuration that the C++ component uses during `setup()` to call `esp_now_init()`, `esp_now_set_pmk()`, and `esp_now_add_peer()` for each declared peer.
+Configured under the top-level `espnow:` key. Declares the node's PMK (optional), the channel policy (explicit channel or inherit from `wifi:`), and the static list of peers with their MAC addresses and optional LMKs. Also exposes two behavioral flags that align with the official component:[^4][^5]
 
-**Primitive 2 — Publish (send and broadcast).**  
-Two actions: `espnow.send` for unicast and `espnow.broadcast` for broadcast.
+`enable_on_boot: true` — when set to false, ESP-NOW is not initialized at startup; the user must trigger initialization manually. Useful for power-managed deployments.
 
-`espnow.send` sends a payload to a single peer identified by MAC address or peer id. The peer must have been declared in the peer list. The `topic` field is an integer used to route the message on the receiver side. The `payload` field is a byte array, either as a literal (`[0x01]`) or via a lambda expression for dynamic content.
+`auto_add_peer: false` — when set to true, any peer the device receives from is automatically registered as an unencrypted peer, even if not in the static list. When false (the default), frames from unknown peers fire the `on_unknown_peer` trigger instead of being silently discarded.
 
-`espnow.broadcast` sends a payload to `FF:FF:FF:FF:FF:FF` without a specific peer target. It takes the same `topic` and `payload` fields as `espnow.send` but no `peer` field. Broadcast frames cannot be encrypted. This action does not require the broadcast address to be in the peer list.
+This primitive has no runtime behavior beyond what these flags configure — it is setup-time configuration translated into `esp_now_init()`, `esp_now_set_pmk()`, and `esp_now_add_peer()` calls.
+
+**Primitive 2 — Publish (send and broadcast) and peer management.**  
+Four actions in this group: `espnow.send`, `espnow.broadcast`, `espnow.peer.add`, and `espnow.peer.delete`.
+
+`espnow.send` sends a payload to a single peer identified by MAC address or peer id. The peer must have been declared in the static list or added at runtime via `espnow.peer.add`. The `topic` field is an integer used to route the message on the receiver side. The `payload` field accepts a byte array literal, a plain string (converted to UTF-8), or a templatable value (lambda returning `std::vector<uint8_t>`). Two additional options align with the official component:[^4][^5] `wait_for_sent: true` blocks the automation until the MAC-layer send callback fires; `continue_on_error: false` halts the automation if the send fails.
+
+`espnow.broadcast` sends a payload to `FF:FF:FF:FF:FF:FF`. It takes the same `topic`, `payload`, `wait_for_sent`, and `continue_on_error` fields as `espnow.send` but no `peer` field. Broadcast frames cannot be encrypted. This action does not require the broadcast address to be in the peer list.
+
+`espnow.peer.add` and `espnow.peer.delete` manage the peer list at runtime, taking a MAC address. These enable use cases where peers are discovered dynamically rather than declared statically — for example, a hub that accepts connections from arbitrary sensor nodes.
 
 **Primitive 3 — Subscribe (receive).**  
-The `on_receive` trigger under `espnow:`. Fires when a frame is received, optionally filtered by topic. The trigger context exposes the sender's MAC address, the raw payload bytes, and the payload length. These variables are available inside the `then:` block via ESPHome's automation system, including in lambda conditions and actions. Because the receive callback fires in the WiFi task, incoming frames are queued internally and dispatched in the main loop.
+Three triggers, all aligning with the official component:[^4][^6]
+
+`on_receive` fires for unicast frames addressed to this device, optionally filtered by topic. `on_broadcast` fires for broadcast frames (`FF:FF:FF:FF:FF:FF`), also optionally filtered by topic. `on_unknown_peer` fires when a frame arrives from a MAC not in the peer list — useful for logging, alerting, or implementing custom peer discovery logic.
+
+All three triggers expose the same context variables: `info` (a struct containing `src_addr`), `data` (`const uint8_t*`), and `size` (`uint8_t`). This naming matches the official component.[^5][^6] On ESP8266, `info` contains only `src_addr` — RSSI and destination address are not available in the receive callback (see Section 2.5). This is a documented platform divergence, not a design choice.
+
+Because the receive callback fires in the WiFi task, all incoming frames are queued internally and dispatched in the main loop before any trigger fires.
 
 **Primitive 4 — Channel configuration.**  
 Controls which 802.11 channel ESP-NOW operates on. Two modes: explicit (a fixed integer 1–13, used when no `wifi:` component is present or when channel isolation is required) and automatic (channel `0`, which tracks the current STA/SoftAP channel). When `wifi:` is active, channel `0` is the correct default. When operating standalone, an explicit channel must be set. The channel field is part of each peer's configuration in `esp_now_peer_info_t`, so the channel policy is per-peer — though in practice all peers should use the same channel policy.
@@ -219,9 +233,9 @@ Controls which 802.11 channel ESP-NOW operates on. Two modes: explicit (a fixed 
 
 The receive callback (`static void recv_cb(...)`) is a static method that runs in the WiFi task. Its only job is to push the incoming frame into the queue. All dispatch logic runs in `loop()` on the main task.
 
-`ESPNowSendAction<>` and `ESPNowBroadcastAction<>` are `Action<>` templates that the codegen instantiates for each `espnow.send:` and `espnow.broadcast:` block in the YAML respectively.
+`ESPNowSendAction<>`, `ESPNowBroadcastAction<>`, `ESPNowAddPeerAction<>`, `ESPNowDeletePeerAction<>`, and `ESPNowSetChannelAction<>` are `Action<>` templates instantiated by the codegen for the corresponding YAML actions.
 
-`ESPNowMessageTrigger` is a `Trigger<>` that fires from `loop()` for each received frame matching its configured topic filter (or all frames if no filter is set).
+`ESPNowOnReceiveTrigger`, `ESPNowOnBroadcastTrigger`, and `ESPNowOnUnknownPeerTrigger` are `Trigger<const ESPNowRecvInfo &, const uint8_t *, uint8_t>` specializations that fire from `loop()` when the receive queue contains a matching frame.
 
 ### 5.4 Declarative Layer as Explicit Composition
 
@@ -547,31 +561,31 @@ No sensitive payload content should appear in log output at any level.
 
 ## 8. Open Questions
 
-These are points where a decision has not yet been made. They should be resolved before implementation begins, or at the latest before the first non-draft version of this document.
+Resolved questions are retained for reference. Unresolved questions should be closed before the first non-draft version of this document.
 
 **Q1: Topic identifier width.**  
-Currently sketched as `uint8_t` (0–255). This provides 256 distinct topics per node pair, which is more than enough for any anticipated use case. `uint16_t` would allow namespacing (e.g., top byte = application, bottom byte = entity) at the cost of one byte of overhead per frame. Decision pending.
+Currently sketched as `uint8_t` (0–255). The official ESPHome component has no topic concept — payload is raw bytes and routing is left to the user. Our topic system is an extension with no ecosystem precedent to align against. `uint8_t` covers all anticipated use cases; `uint16_t` would allow namespacing (top byte = application, bottom byte = entity) at the cost of one byte per frame. Decision pending.
 
-**Q2: Payload encoding in the flexible layer.**  
-The `espnow.send` action needs to accept a payload. Options: (a) raw byte array literal `[0x01, 0x02]` only, (b) byte array or lambda returning `std::vector<uint8_t>`, (c) built-in type helpers (`payload: {float: sensor.state}`, `payload: {bool: switch.state}`). Option (b) is the most consistent with how ESPHome handles dynamic values elsewhere. Option (c) reduces the need for manual encoding lambdas in the flexible layer but adds complexity. The decision affects how the case 2 flexible-layer example looks.
+**Q2 (resolved): Payload encoding in the flexible layer.**  
+Payload accepts a byte array literal (`[0x01, 0x02]`), a plain string (converted to UTF-8 bytes), or a templatable value (lambda returning `std::vector<uint8_t>`). Aligns with the official component.[^4][^5]
 
-**Q3: Variables exposed in `on_receive` trigger context.**  
-The receive callback provides source MAC, payload pointer, and payload length. The trigger context should expose at minimum: `mac` (`uint8_t[6]`), `data` (`const uint8_t*`), `len` (`int`). Whether to also expose a convenience `topic` variable (the topic that matched the filter) and a `std::vector<uint8_t>` copy of the payload (safer for async use) is TBD.
+**Q3 (resolved): Variables exposed in trigger context.**  
+All three receive triggers (`on_receive`, `on_broadcast`, `on_unknown_peer`) expose `info` (struct with `src_addr`), `data` (`const uint8_t*`), and `size` (`uint8_t`), matching the official component's names.[^5][^6] On ESP8266, `info` contains only `src_addr` — RSSI and destination address are unavailable (platform constraint, see Section 2.5). This divergence is documented per the alignment principle.
 
-**Q4: Broadcast send and peer registration.**  
-On ESP8266, can `esp_now_send()` to `FF:FF:FF:FF:FF:FF` succeed without adding the broadcast address as a peer? The IDF documentation implies yes for unencrypted broadcast, but this needs to be verified empirically. If broadcast requires peer registration, `espnow.broadcast` should add it automatically and transparently.
+**Q4 (resolved): Broadcast send and peer registration.**  
+`espnow.broadcast` does not require the broadcast address to be in the peer list. If the underlying `esp_now_send()` requires it on ESP8266, the component registers `FF:FF:FF:FF:FF:FF` transparently. Aligns with the official component's behavior.[^4]
 
 **Q5: WiFi channel change at runtime.**  
-If the device disconnects from the AP and reconnects to a different AP on a different channel (possible with roaming or mesh), does ESP-NOW continue to work correctly with `channel: 0` peers? Or does the channel stored in `esp_now_peer_info_t` need to be updated via `esp_now_mod_peer()`? The behavior depends on when ESP8266 resolves `channel: 0` — at `add_peer` time or at `send` time. Needs verification.
+If the device loses WiFi and reconnects on a different channel, does `channel: 0` in `esp_now_peer_info_t` resolve correctly, or does the stored channel need updating via `esp_now_mod_peer()`? The behavior depends on whether ESP8266 resolves channel 0 at `add_peer` time or at `send` time. Needs empirical verification.
 
-**Q6: Multiple `on_receive` handlers for the same topic.**  
-If the user declares two `espnow: on_receive:` blocks with the same topic, should both fire, or should it be an error? The ESPHome convention for other trigger types is to allow multiple handlers. Unless there is a reason to deviate, both should fire.
+**Q6 (resolved): Multiple handlers for the same topic.**  
+Multiple `on_receive:` (or `on_broadcast:`) blocks with the same topic are all allowed and all fire. Standard ESPHome trigger behavior, confirmed by the official component.[^4]
 
-**Q7: Sending to an undeclared peer.**  
-If `espnow.send` is called with a peer that was not declared in the `espnow: peers:` list (e.g., via a dynamic MAC in a lambda), should the component auto-add the peer as unencrypted and attempt the send, or return an error? Auto-add is convenient but may surprise users who expect explicit peer declaration to be enforced. Explicit error is safer.
+**Q7 (resolved): Sending to an undeclared peer.**  
+`espnow.send` to a MAC not in the peer list returns an error. The `auto_add_peer` option (see Primitive 1) governs receive-side auto-registration only; send-side enforcement is strict by default. Aligns with the official component.[^4][^5]
 
 **Q8: SoftAP mode.**  
-If the user runs the ESP8266 as a SoftAP (rather than STA), the device controls its own channel. Does the component need to handle this case differently? In SoftAP mode, `channel: 0` would resolve to the SoftAP channel, which the device itself set. This should work transparently, but it has not been verified.
+If the device runs as a SoftAP, `channel: 0` should resolve to the SoftAP channel transparently. Behavior has not been verified on ESP8266.
 
 ---
 
@@ -608,3 +622,6 @@ ESPHome only supports the Arduino framework for ESP8266. There is no RTOS SDK / 
 [^1]: Espressif. *ESP-NOW — ESP-IDF Programming Guide (ESP32)*. https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/network/esp_now.html  
 [^2]: Espressif. *ESP8266 RTOS SDK — `esp_now.h`*. https://github.com/espressif/ESP8266_RTOS_SDK/blob/master/components/esp8266/include/esp_now.h  
 [^3]: Espressif. *ESP-IDF — `esp_now.h`*. https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_now.h  
+[^4]: ESPHome. *ESP-NOW Component — User Documentation*. https://esphome.io/components/espnow/  
+[^5]: ESPHome. *ESP-NOW Component — `__init__.py`*. https://github.com/esphome/esphome/blob/dev/esphome/components/espnow/__init__.py  
+[^6]: ESPHome. *ESP-NOW Component — `automation.h`*. https://github.com/esphome/esphome/blob/dev/esphome/components/espnow/automation.h  
