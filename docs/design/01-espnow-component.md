@@ -175,6 +175,8 @@ A node relays frames on behalf of others to extend the physical range of the net
 
 **Declarative YAML at the high level.** The declarative layer must be expressible in pure YAML: no `lambda:` blocks, no manual `.h` includes, no `custom_component:`. This is both an aesthetic goal and a compatibility requirement — `custom_component` was removed in ESPHome 2025.2. The component must use the modern `external_components:` mechanism with proper `__init__.py` + platform `.py` + `.cpp`/`.h` structure. Lambda use in the flexible layer is expected and acceptable; it is the nature of that layer. The no-lambda constraint applies to the declarative layer only.
 
+**API alignment with the official ESPHome ESP-NOW component.** Where applicable, the public YAML API mirrors the official ESPHome ESP-NOW component for ESP32. This minimizes cognitive overhead for users moving between platforms and aligns this component with established conventions in the ecosystem. A user who has read the official component's documentation should find familiar keys, action names, and trigger names here. Divergence is permitted only when ESP8266-specific constraints make alignment impossible (e.g., the absence of RSSI in the receive callback), or when extending the API beyond what the official component covers (e.g., the declarative layer and the topic-based routing model). In both cases the divergence must be documented explicitly.
+
 ---
 
 ## 5. Proposed Architecture
@@ -495,6 +497,10 @@ The most common deployment has both `wifi:` and `espnow:` active simultaneously.
 - With `channel: 0` on all peers, ESP-NOW automatically uses the STA channel. No explicit channel management is needed.
 
 The problem case is channel change after reconnection. If the device loses WiFi and reconnects to an AP on a different channel (possible when using mesh systems or multiple APs), existing peers configured with channel 0 adapt automatically because channel 0 is resolved at send time, not at add-peer time. Peers configured with an explicit channel will silently fail to communicate until the mismatch is corrected. This component defaults to channel 0 when `wifi:` is present and makes the explicit-channel option a deliberate override.
+
+**Behavior on AP channel change matches the official component.** When the WiFi connection drops and reconnects on a different channel, recovery is implicit: the `wifi:` component handles reassociation, and once the STA is associated to the new channel, ESP-NOW frames sent with channel 0 will use the correct channel automatically. No active channel tracking is needed in firmware. This is consistent with how the official ESP-NOW component for ESP32 handles the same scenario — both rely on the WiFi stack's reassociation rather than implementing their own channel-change logic.
+
+For deployments that need explicit channel control — for example, an ESP-NOW-only node that must switch channels on demand — the official ESP32 component exposes a `change_channel` action. This component will expose an equivalent `espnow.set_channel` action that calls `esp_now_mod_peer()` on all registered peers. This is a v1 feature given the alignment principle, even though the motivating use case does not require it.
 
 A secondary concern: in a house with multiple access points, different ESP8266 nodes may connect to different APs on different channels, breaking ESP-NOW communication between them even though they share the same SSID. This is a deployment constraint, not a firmware constraint, but it should be called out in user-facing documentation.
 
