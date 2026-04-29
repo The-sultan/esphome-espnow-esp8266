@@ -1,0 +1,603 @@
+# ESP-NOW External Component for ESP8266 — Design Document
+
+**Version:** 0.1  
+**Status:** Draft — open for discussion
+
+---
+
+## Contents
+
+1. [Context and Motivation](#1-context-and-motivation)
+2. [Technical Background on ESP-NOW](#2-technical-background-on-esp-now)
+3. [Target Use Cases](#3-target-use-cases)
+4. [Design Principles](#4-design-principles)
+5. [Proposed Architecture](#5-proposed-architecture)
+6. [YAML API Sketches](#6-yaml-api-sketches)
+7. [ESP8266-Specific Considerations](#7-esp8266-specific-considerations)
+8. [Open Questions](#8-open-questions)
+9. [Out of Scope for v1](#9-out-of-scope-for-v1)
+10. [References](#10-references)
+
+---
+
+## 1. Context and Motivation
+
+ESPHome is the dominant declarative firmware platform for ESP-based devices in self-hosted home automation. It covers the full stack from sensor reading to WiFi connectivity to Home Assistant integration, with a YAML-driven model that lets experienced users configure complex behavior without writing firmware code.
+
+ESP8266 and ESP8285 remain widely deployed. A large fraction of the Sonoff catalog — Basic, TX series, Mini — runs on these chips, and they continue to ship in new products. Despite ESPHome introducing official ESP-NOW support in the 2025.8 release, that implementation is ESP32-only. The chip difference is not incidental: the official component is built on top of the ESP-IDF ESP-NOW API, which does not exist on ESP8266.
+
+Community external components for ESP8266 ESP-NOW do exist. The ones found at the time of writing share a common set of problems: they require lambdas in user YAML, include manual `.h` file imports, or are structured as `custom_component` — a mechanism that was deprecated in ESPHome 2024.x and removed in 2025.2. None of them would pass review as a first-party ESPHome component, and none provide the layered API model described in this document.
+
+The motivating use case is a pair of Sonoff TX switches (ESP8285) controlling the same light from two physical locations. Today they are synchronized through Home Assistant: switch A triggers an automation that commands switch B. This introduces a perceptible round-trip latency — WiFi → HA automation → WiFi — that is noticeable when someone is at the wall. ESP-NOW eliminates the HA dependency for this path entirely. Both devices communicate directly at the 802.11 data link layer; the synchronization path involves no router, no broker, and no cloud.
+
+That said, the motivating use case is two devices. The protocol supports up to 20 peers. This component is designed against the protocol's actual capability, not against the use case that motivated its creation.
+
+---
+
+## 2. Technical Background on ESP-NOW
+
+### 2.1 Protocol Layer
+
+ESP-NOW is an Espressif proprietary protocol that operates at IEEE 802.11 layer 2, using vendor-specific action frames.[^1] There is no WiFi association involved: devices do not need to join an access point to communicate with each other, and the protocol works regardless of whether a WiFi connection to an AP is present.
+
+The frame structure is:
+
+```
+MAC Header (24 B)
+  ├── Destination address
+  ├── Source address
+  └── BSSID: FF:FF:FF:FF:FF:FF (broadcast)
+Category Code (1 B): 0x7F (vendor-specific)
+Organization Identifier (3 B): 0x18 0xFE 0x34 (Espressif)
+Random value (4 B)
+Vendor-specific element:
+  ├── Element ID
+  ├── Length
+  ├── Organization ID
+  ├── Type
+  ├── Version
+  └── Body (0–250 B)
+FCS (4 B)
+```
+
+Note that the FromDS and ToDS bits in the MAC header are both 0, and the third address field is set to the broadcast address regardless of whether the frame is unicast or multicast.[^1] This distinguishes ESP-NOW frames from normal data frames at the 802.11 level.
+
+The default PHY bitrate is 1 Mbps.
+
+### 2.2 Payload and Peer Limits
+
+The maximum application payload is **250 bytes** per frame (v1.0 protocol, `ESP_NOW_MAX_DATA_LEN`). ESP-IDF introduced ESP-NOW v2.0 for ESP32 with a 1470-byte limit, but ESP8266 implements v1.0 only. The 250-byte constraint applies to all ESP8266 deployments without exception.
+
+Peer limits for ESP8266:[^2]
+
+- Maximum total peers: **20** (`ESP_NOW_MAX_TOTAL_PEER_NUM`)
+- Maximum encrypted peers: **6** (`ESP_NOW_MAX_ENCRYPT_PEER_NUM`)
+
+On ESP32 with IDF, the encrypted peer limit is configurable and defaults to 7 (up to 17). On ESP8266 the limit is fixed at 6 with no runtime configuration.
+
+### 2.3 Encryption
+
+ESP-NOW uses a two-level key hierarchy:[^1]
+
+**PMK (Primary Master Key):** 16 bytes. Set per node with `esp_now_set_pmk()`. Used to encrypt the LMKs. If no PMK is set, a fixed default is used — this provides no meaningful security.
+
+**LMK (Local Master Key):** 16 bytes, set per peer. Used to encrypt the vendor-specific action frame body using CCMP (Counter Mode with CBC-MAC Protocol, AES-128, as defined in IEEE 802.11-2012).
+
+Broadcast and multicast frames cannot be encrypted. Only unicast frames to peers that have an LMK configured are encrypted.
+
+Encryption is optional on a per-peer basis. A node can have some encrypted peers and some unencrypted ones simultaneously, subject to the 6-peer encrypted limit.
+
+### 2.4 Channel Handling
+
+All devices communicating via ESP-NOW must be on the same 802.11 channel. When adding a peer, the channel field of `esp_now_peer_info_t` accepts either an explicit channel (1–13) or `0`, which means "use the current channel of the active WiFi interface."[^2]
+
+Channel 0 is the correct choice in the common case where the device also runs a `wifi:` component in STA mode: the channel is then determined by the AP the device is associated to, and ESP-NOW frames are sent and received on that same channel without any extra configuration.
+
+When no `wifi:` component is active (ESP-NOW-only mode), the channel must be set explicitly. All communicating nodes must agree on a channel out of band (typically hardcoded in the YAML).
+
+The constraint that all peers share one channel becomes important in environments where different APs are used on different channels. In a typical home installation with a single SSID, this is not a problem.
+
+### 2.5 Callback Model
+
+The ESP8266 RTOS SDK exposes two callbacks:[^2]
+
+**Send callback** (`esp_now_send_cb_t`): called after the frame has been transmitted, with the destination MAC and a status (`ESP_NOW_SEND_SUCCESS` / `ESP_NOW_SEND_FAIL`). The status reflects MAC-layer acknowledgment — it confirms the frame left the radio and was ACKed at layer 2. It does not confirm delivery to the remote application.
+
+**Receive callback** (`esp_now_recv_cb_t`): called when a valid ESP-NOW frame is received, with the source MAC address, payload pointer, and payload length.
+
+On ESP8266, the receive callback signature is:
+
+```c
+void on_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len);
+```
+
+This is notably different from the current ESP32 IDF version, which passes an `esp_now_recv_info_t` struct containing source address, destination address, RSSI, and timestamp. **On ESP8266, RSSI and destination MAC are not available in the receive callback.** This is a hard platform constraint, not a design choice.
+
+Both callbacks execute in the WiFi task context, which has higher priority than the main ESPHome loop. All non-trivial work must be deferred from callback context to the main loop.
+
+### 2.6 ESP8266 API vs ESP32 ESP-IDF
+
+The ESP8266 RTOS SDK exposes an IDF-style API (`esp8266/include/esp_now.h`) that is largely compatible with the ESP32 IDF at the function-name level, but with the following differences:[^2][^3]
+
+| Feature | ESP8266 | ESP32 IDF |
+|---|---|---|
+| Encrypted peer limit | 6 (fixed) | 7 default, up to 17 configurable |
+| ESP-NOW v2.0 (1470 B payload) | Not supported | Supported |
+| Recv callback includes RSSI/dest | No | Yes (newer IDF) |
+| PHY rate config per peer | No | Yes (`esp_now_rate_config_t`) |
+| Wake window (power management) | No | Yes |
+| Role system (CONTROLLER/SLAVE) | Old NonOS SDK only | Never existed in IDF |
+
+The "role" system (`ESP_NOW_ROLE_CONTROLLER`, `ESP_NOW_ROLE_SLAVE`, `ESP_NOW_ROLE_COMBO`) belongs to the legacy NonOS SDK (pre-RTOS). It does not exist in the RTOS SDK or in the IDF. Any reference to roles in community ESP8266 code is a sign of an outdated SDK dependency.
+
+---
+
+## 3. Target Use Cases
+
+### 3.1 v1 Use Cases
+
+**Case 1: Shared state synchronization between N peers.**  
+Multiple nodes share ownership of a single logical state (e.g., a light's on/off state). Any node can change the state; all nodes must reflect the current state. The model is symmetric: no node has a privileged role. When a node changes its local state, it broadcasts the new value to all peers; when a node receives a state update, it applies it locally.
+
+The motivating instance of this case is two Sonoff TX switches controlling the same light. One is wired to the relay; the other is wired only to mains (the relay output is unconnected). From the component's perspective, both are symmetric participants in a state sync group — the electrical asymmetry is invisible.
+
+Conflict resolution: last-write-wins, implicitly. The probability of two users pressing physical buttons simultaneously is negligible for residential use, so no additional mechanism is warranted.
+
+**Case 2: Unidirectional telemetry from sensor node to hub.**  
+A battery- or remotely-placed sensor node (temperature, humidity, motion) periodically sends readings to a hub node. The hub receives the data and exposes it to ESPHome's sensor infrastructure (and thus to Home Assistant). This is a strict sender-receiver relationship with no response.
+
+### 3.2 Future Use Cases
+
+These use cases are out of scope for v1 but are explicitly considered in the primitive design. The v1 primitives must be sufficient to implement each of these without firmware modification.
+
+**Case 3: Unidirectional remote command (actuator side).**  
+One node sends a command; another node executes it. Conceptually the inverse of case 2: instead of reporting a sensor reading, the sender triggers an action on the receiver. This is constructible from v1 primitives (send an `espnow.send` action; receive with `on_message` and execute the desired action). A declarative abstraction for this case is deferred.
+
+**Case 4: Broadcast / topic-based pub-sub without explicit peer list.**  
+A node publishes to a topic without maintaining a per-peer list; any node subscribed to that topic receives it. This requires either a broadcast send (to `FF:FF:FF:FF:FF:FF`) or a group MAC. The primitive `espnow.send` supports broadcast natively; a higher-level pub-sub abstraction that manages subscriptions and routing is deferred.
+
+**Case 5: Mesh repeater / range extender.**  
+A node relays frames on behalf of others to extend the physical range of the network. This requires topology awareness and forwarding logic that goes beyond the scope of a simple ESP-NOW component. Not blocked by primitives, but not a v1 priority.
+
+---
+
+## 4. Design Principles
+
+**Layered API with both layers as first-class citizens.** The component exposes two public APIs. The flexible layer consists of primitives that mirror what ESP-NOW actually provides: peer management, send, receive, channel configuration. The declarative layer consists of higher-level abstractions — like state sync groups or telemetry channels — that are implemented as explicit, documented compositions of those primitives. Neither layer is secondary. Users can mix them freely in the same YAML, using declarative abstractions where they fit and dropping to primitives where they need more control. The key commitment: every declarative abstraction must be accompanied by documentation showing exactly which primitive operations it expands to.
+
+**Primitives are designed against the protocol space, not against the motivating use case.** The motivating use case involves two switches. ESP-NOW supports up to 20 peers. The primitive for peer management handles N peers, not a "pair." This principle prevents the common trap of over-fitting an API to the first use case and then discovering it needs to be redesigned when a slightly different use case arrives. The motivating use case determines which primitives to prioritize and the shape of the declarative abstractions; it does not constrain the primitive surface.
+
+**Minimal logic in firmware.** Any logic that can reasonably live in a higher layer — ESPHome automations, Home Assistant scripts, Node-RED — should live there. The firmware's responsibility is to provide reliable, low-latency transport. The exception to this principle is when delegating to a higher layer introduces an unacceptable cost, typically latency. Synchronizing two physical switches via Home Assistant costs a perceptible round trip. Synchronizing them via ESP-NOW over direct Layer 2 communication does not. That latency difference is the entire reason this component exists. Outside of cases with a latency justification, the rule holds: features like heartbeat detection, re-sync on reconnect, and conflict resolution beyond last-write-wins are left for higher layers.
+
+**Completeness of v1 primitives.** The four primitives described in Section 5 must be sufficient for a user to implement any reasonable higher-order feature without modifying firmware. Heartbeat, liveness detection, re-sync on boot, and conditional routing are all implementable today using the primitives plus ESPHome's existing automation system (`interval:`, `on_boot:`, `script:`, `binary_sensor: template:`, etc.). Section 6 demonstrates this explicitly. If a future use case arises that cannot be expressed as a composition of v1 primitives, that indicates a gap in the primitive design — not an argument for adding a new primitive. The correct response is to close the gap.
+
+**Target audience: experienced ESPHome users.** This component is not intended for someone encountering ESPHome for the first time. The person who reaches for an external component implementing a low-level wireless protocol has already navigated firmware flashing, YAML configuration, device discovery, and Home Assistant integration. The API should not be diluted to accommodate beginners. Complexity that would confuse a novice but is entirely natural to an experienced user — like hex byte arrays, MAC address strings, or explicit channel configuration — is acceptable and appropriate.
+
+**Declarative YAML at the high level.** The declarative layer must be expressible in pure YAML: no `lambda:` blocks, no manual `.h` includes, no `custom_component:`. This is both an aesthetic goal and a compatibility requirement — `custom_component` was removed in ESPHome 2025.2. The component must use the modern `external_components:` mechanism with proper `__init__.py` + platform `.py` + `.cpp`/`.h` structure. Lambda use in the flexible layer is expected and acceptable; it is the nature of that layer. The no-lambda constraint applies to the declarative layer only.
+
+---
+
+## 5. Proposed Architecture
+
+### 5.1 Component Structure
+
+```
+components/espnow/
+  __init__.py          # espnow: block — node identity, peer list, PMK, channel,
+                       # on_message triggers, espnow.send action
+  switch.py            # espnow_sync declarative abstraction for switches
+  sensor.py            # espnow telemetry: publisher mixin and receiver platform
+  espnow_component.h
+  espnow_component.cpp
+```
+
+The Python layer is responsible for config validation and C++ code generation. It does not contain runtime logic. The C++ layer contains all runtime behavior.
+
+### 5.2 The Four Primitives
+
+**Primitive 1 — Node identity and peer list.**  
+Configured under the top-level `espnow:` key. Declares the node's PMK (optional), the channel policy (explicit channel or inherit from `wifi:`), and the list of peers with their MAC addresses and optional LMKs. This primitive has no runtime behavior on its own — it is configuration that the C++ component uses during `setup()` to call `esp_now_init()`, `esp_now_set_pmk()`, and `esp_now_add_peer()` for each declared peer.
+
+**Primitive 2 — Publish (send).**  
+The `espnow.send` action. Sends a payload to a peer (by MAC address or peer id) with a topic identifier. The peer must have been declared in the peer list. The special value `broadcast` addresses `FF:FF:FF:FF:FF:FF`. The `topic` field is an integer used to route messages on the receiver side. The `payload` field is a byte array, either as a literal (`[0x01]`) or via a lambda expression for dynamic content.
+
+**Primitive 3 — Subscribe (receive).**  
+The `on_message` trigger under `espnow:`. Fires when a frame is received, optionally filtered by topic. The trigger context exposes the sender's MAC address, the raw payload bytes, and the payload length. These variables are available inside the `then:` block via ESPHome's automation system, including in lambda conditions and actions. Because the receive callback fires in the WiFi task, incoming frames are queued internally and dispatched in the main loop.
+
+**Primitive 4 — Channel configuration.**  
+Controls which 802.11 channel ESP-NOW operates on. Two modes: explicit (a fixed integer 1–13, used when no `wifi:` component is present or when channel isolation is required) and automatic (channel `0`, which tracks the current STA/SoftAP channel). When `wifi:` is active, channel `0` is the correct default. When operating standalone, an explicit channel must be set. The channel field is part of each peer's configuration in `esp_now_peer_info_t`, so the channel policy is per-peer — though in practice all peers should use the same channel policy.
+
+### 5.3 C++ Runtime
+
+`ESPNowComponent` extends `esphome::Component`. In `setup()` it initializes ESP-NOW, sets the PMK if configured, and registers all declared peers. In `loop()` it dispatches messages from the receive queue. The queue is a fixed-size ring buffer to avoid heap fragmentation — a design constraint driven by ESP8266's limited DRAM (see Section 7).
+
+The receive callback (`static void recv_cb(...)`) is a static method that runs in the WiFi task. Its only job is to push the incoming frame into the queue. All dispatch logic runs in `loop()` on the main task.
+
+`ESPNowSendAction<>` is an `Action<>` template that the codegen instantiates for each `espnow.send:` block in the YAML.
+
+`ESPNowMessageTrigger` is a `Trigger<>` that fires from `loop()` for each received frame matching its configured topic filter (or all frames if no filter is set).
+
+### 5.4 Declarative Layer as Explicit Composition
+
+Each declarative abstraction in `switch.py` and `sensor.py` is implemented by emitting, at codegen time, the same C++ and automation graph that a user would write manually using the flexible layer. The design documentation for each abstraction must include a "this expands to" block showing the equivalent primitive YAML. This is not just documentation policy — it is the design's correctness criterion. If an abstraction cannot be expressed as primitive composition, the primitive layer has a gap.
+
+---
+
+## 6. YAML API Sketches
+
+These are design sketches, not a final API specification. Names, structure, and exact semantics may change during implementation. They exist to validate that the primitive design is coherent and complete.
+
+### 6.1 Flexible Layer
+
+#### Case 1 — Shared state sync, explicit primitive composition
+
+Both nodes run identical configuration. Node A's MAC is `AA:BB:CC:DD:EE:FF`; node B's is `11:22:33:44:55:66`.
+
+**Node A config:**
+
+```yaml
+espnow:
+  channel: 0              # inherit from wifi: component
+  pmk: "my-pmk-16bytes"   # optional; if set, enables LMK encryption
+  peers:
+    - mac: "11:22:33:44:55:66"
+      id: node_b
+      lmk: "lmk-for-nodeb"  # optional; omit for unencrypted
+
+switch:
+  - platform: gpio
+    pin: GPIO12
+    id: relay
+    on_turn_on:
+      - espnow.send:
+          peer: node_b
+          topic: 0x01
+          payload: [0x01]
+    on_turn_off:
+      - espnow.send:
+          peer: node_b
+          topic: 0x01
+          payload: [0x00]
+
+espnow:
+  on_message:
+    topic: 0x01
+    then:
+      - if:
+          condition:
+            lambda: "return data[0] != 0;"
+          then:
+            - switch.turn_on: relay
+          else:
+            - switch.turn_off: relay
+```
+
+Node B's config is symmetric: swap the MAC addresses and the peer id.
+
+#### Case 2 — Telemetry, explicit primitive composition
+
+**Sensor node:**
+
+```yaml
+espnow:
+  channel: 6          # explicit channel, no wifi: component on this node
+  peers:
+    - mac: "HUB:MA:CA:DD:RE:SS"
+      id: hub
+
+sensor:
+  - platform: dht
+    pin: GPIO4
+    temperature:
+      id: temp
+      on_value:
+        - espnow.send:
+            peer: hub
+            topic: 0x10
+            payload: !lambda |
+              uint8_t buf[4];
+              float v = x;
+              memcpy(buf, &v, 4);
+              return std::vector<uint8_t>(buf, buf + 4);
+```
+
+**Hub node:**
+
+```yaml
+espnow:
+  channel: 6
+  peers:
+    - mac: "SENSOR:NODE:MAC:AD:DR:ES"
+      id: sensor_node
+
+espnow:
+  on_message:
+    topic: 0x10
+    then:
+      - lambda: |
+          float v;
+          memcpy(&v, data, 4);
+          id(remote_temp).publish_state(v);
+
+sensor:
+  - platform: template
+    id: remote_temp
+    name: "Remote Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+```
+
+The float encoding in these examples is illustrative. The exact payload encoding API for the flexible layer is an open question (see Section 8).
+
+### 6.2 Declarative Layer
+
+#### Case 1 — Shared state sync, declarative abstraction
+
+```yaml
+espnow:
+  channel: 0
+  peers:
+    - mac: "11:22:33:44:55:66"
+      id: node_b
+      lmk: "lmk-for-nodeb"
+
+switch:
+  - platform: gpio
+    pin: GPIO12
+    id: relay
+    espnow_sync:
+      topic: 0x01
+      peers:
+        - node_b
+```
+
+The `espnow_sync` key instructs the component to:
+1. On `turn_on` or `turn_off`: send the new state to all listed peers with the configured topic.
+2. On `on_message` for the configured topic: apply the received state locally without re-transmitting.
+
+This expands to exactly the flexible-layer configuration shown in section 6.1, case 1.
+
+#### Case 2 — Telemetry, declarative abstraction
+
+**Sensor node:**
+
+```yaml
+espnow:
+  channel: 6
+  peers:
+    - mac: "HUB:MA:CA:DD:RE:SS"
+      id: hub
+
+sensor:
+  - platform: dht
+    pin: GPIO4
+    temperature:
+      id: temp
+      espnow_publish:
+        peer: hub
+        topic: 0x10
+```
+
+**Hub node:**
+
+```yaml
+espnow:
+  channel: 6
+  peers:
+    - mac: "SENSOR:NODE:MAC:AD:DR:ES"
+      id: sensor_node
+
+sensor:
+  - platform: espnow
+    id: remote_temp
+    source: sensor_node     # optional: filter by source peer
+    topic: 0x10
+    name: "Remote Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+```
+
+The `platform: espnow` sensor receives frames, decodes the payload using the same encoding the `espnow_publish` mixin uses, and calls `publish_state()`. Because both sides use the same declarative abstraction, the encoding is handled internally and consistently.
+
+### 6.3 Demonstrating Primitive Completeness: Heartbeat and Re-sync
+
+These examples show that features intentionally left out of v1 are fully implementable today using the primitives plus ESPHome's existing automation system. No firmware modification is required.
+
+#### Heartbeat / liveness detection
+
+```yaml
+# Sender: every 30 s, send a heartbeat with empty payload
+interval:
+  - interval: 30s
+    then:
+      - espnow.send:
+          peer: peer_a
+          topic: 0xFE
+          payload: []
+
+# Receiver: track peer liveness with a template binary sensor + restart script
+binary_sensor:
+  - platform: template
+    id: peer_alive
+    device_class: connectivity
+
+script:
+  - id: peer_timeout
+    mode: restart         # each new heartbeat restarts the 90 s window
+    then:
+      - delay: 90s        # 3 missed heartbeats at 30 s interval
+      - binary_sensor.template.publish:
+          id: peer_alive
+          state: false
+
+espnow:
+  on_message:
+    topic: 0xFE
+    then:
+      - binary_sensor.template.publish:
+          id: peer_alive
+          state: true
+      - script.execute: peer_timeout
+
+on_boot:
+  then:
+    - script.execute: peer_timeout   # start the timeout from boot
+```
+
+#### State re-sync on boot
+
+A node that reboots has lost its last-known state. It can request a re-broadcast from peers using a dedicated "state request" topic.
+
+```yaml
+# On boot, broadcast a state request
+on_boot:
+  priority: -100.0    # after all components are initialized
+  then:
+    - espnow.send:
+        peer: broadcast
+        topic: 0xFF
+        payload: []
+
+# Respond to a state request by re-sending current state
+espnow:
+  on_message:
+    topic: 0xFF
+    then:
+      - if:
+          condition:
+            lambda: "return id(relay).state;"
+          then:
+            - espnow.send:
+                peer: broadcast
+                topic: 0x01
+                payload: [0x01]
+          else:
+            - espnow.send:
+                peer: broadcast
+                topic: 0x01
+                payload: [0x00]
+```
+
+Both examples use the flexible layer and include lambda conditions. The point is not to avoid lambdas in these advanced use cases, but to confirm that the primitive set is sufficient to express them. A user who needs heartbeat or re-sync can implement it today, entirely in YAML, without waiting for a native abstraction.
+
+---
+
+## 7. ESP8266-Specific Considerations
+
+### 7.1 Channel and WiFi Coexistence
+
+The most common deployment has both `wifi:` and `espnow:` active simultaneously. In this configuration:
+
+- The `wifi:` component connects to the AP during `setup()`, before the main loop.
+- `esp_now_init()` must be called after `esp_wifi_start()`, which happens inside the WiFi component's setup.
+- With `channel: 0` on all peers, ESP-NOW automatically uses the STA channel. No explicit channel management is needed.
+
+The problem case is channel change after reconnection. If the device loses WiFi and reconnects to an AP on a different channel (possible when using mesh systems or multiple APs), existing peers configured with channel 0 adapt automatically because channel 0 is resolved at send time, not at add-peer time. Peers configured with an explicit channel will silently fail to communicate until the mismatch is corrected. This component defaults to channel 0 when `wifi:` is present and makes the explicit-channel option a deliberate override.
+
+A secondary concern: in a house with multiple access points, different ESP8266 nodes may connect to different APs on different channels, breaking ESP-NOW communication between them even though they share the same SSID. This is a deployment constraint, not a firmware constraint, but it should be called out in user-facing documentation.
+
+### 7.2 RAM Constraints
+
+The ESP8266 has approximately 80 KB of usable DRAM after SDK overhead, and the heap is fragmented by the WiFi stack. The component must be designed to minimize heap allocations.
+
+Specific implications:
+
+- The receive queue is a fixed-size static ring buffer, not a dynamic container. Queue depth is configurable at compile time via `espnow_queue_depth:` in the YAML, with a sensible default (e.g., 8 frames).
+- Each queued frame stores up to 250 bytes of payload plus 6 bytes of source MAC. A queue depth of 8 costs 2 KB of static RAM. This is acceptable.
+- The peer list is stored in a static array (maximum 20 entries). No heap allocation for peer management.
+- The component should not use `std::string` for MAC addresses or topic identifiers in the hot path.
+
+### 7.3 OTA Updates
+
+ESPHome's OTA mechanism uses an HTTP server that the device serves over WiFi. During an OTA update, the device is occupied downloading and writing the new firmware. ESP-NOW frames will continue to arrive in the receive callback and will be lost if the main loop is not running.
+
+The correct behavior is to let frames drop silently during OTA — the queue will overflow and discard frames. After the OTA reboot, the re-sync mechanism (if implemented by the user) can restore state. This is not a failure mode that the component needs to handle internally.
+
+### 7.4 Callback Context
+
+Both the send and receive callbacks execute in the WiFi task, which has higher priority than the Arduino `loop()` task. The receive callback must not:
+
+- Allocate heap memory
+- Call ESPHome API functions (which are not thread-safe)
+- Block
+
+The implementation uses a statically allocated ring buffer with an atomic write index. The callback writes to the buffer; `loop()` reads from it and dispatches to triggers. This is the standard deferred-work pattern for ESP8266 WiFi callbacks.
+
+### 7.5 Debug and Logging
+
+ESP8266 has no JTAG. All debug output goes through UART. On Sonoff TX devices, UART0 (TX: GPIO1, RX: GPIO3) is typically the programming port and can be used for debug logging at runtime. UART1 (TX: GPIO2) is TX-only and available as an alternative log output.
+
+The component should emit log messages at appropriate levels:
+- `DEBUG`: successful sends, received frame metadata (topic, source MAC, length)
+- `WARN`: send failures, queue overflow
+- `ERROR`: initialization failures
+
+No sensitive payload content should appear in log output at any level.
+
+---
+
+## 8. Open Questions
+
+These are points where a decision has not yet been made. They should be resolved before implementation begins, or at the latest before the first non-draft version of this document.
+
+**Q1: Topic identifier width.**  
+Currently sketched as `uint8_t` (0–255). This provides 256 distinct topics per node pair, which is more than enough for any anticipated use case. `uint16_t` would allow namespacing (e.g., top byte = application, bottom byte = entity) at the cost of one byte of overhead per frame. Decision pending.
+
+**Q2: Payload encoding in the flexible layer.**  
+The `espnow.send` action needs to accept a payload. Options: (a) raw byte array literal `[0x01, 0x02]` only, (b) byte array or lambda returning `std::vector<uint8_t>`, (c) built-in type helpers (`payload: {float: sensor.state}`, `payload: {bool: switch.state}`). Option (b) is the most consistent with how ESPHome handles dynamic values elsewhere. Option (c) reduces the need for manual encoding lambdas in the flexible layer but adds complexity. The decision affects how the case 2 flexible-layer example looks.
+
+**Q3: Variables exposed in `on_message` trigger context.**  
+The receive callback provides source MAC, payload pointer, and payload length. The trigger context should expose at minimum: `mac` (`uint8_t[6]`), `data` (`const uint8_t*`), `len` (`int`). Whether to also expose a convenience `topic` variable (the topic that matched the filter) and a `std::vector<uint8_t>` copy of the payload (safer for async use) is TBD.
+
+**Q4: Broadcast send and peer registration.**  
+On ESP8266, can `esp_now_send()` to `FF:FF:FF:FF:FF:FF` succeed without adding the broadcast address as a peer? The IDF documentation implies yes for unencrypted broadcast, but this needs to be verified empirically. If broadcast requires peer registration, the component should add it automatically when `peer: broadcast` is used.
+
+**Q5: WiFi channel change at runtime.**  
+If the device disconnects from the AP and reconnects to a different AP on a different channel (possible with roaming or mesh), does ESP-NOW continue to work correctly with `channel: 0` peers? Or does the channel stored in `esp_now_peer_info_t` need to be updated via `esp_now_mod_peer()`? The behavior depends on when ESP8266 resolves `channel: 0` — at `add_peer` time or at `send` time. Needs verification.
+
+**Q6: Multiple `on_message` handlers for the same topic.**  
+If the user declares two `espnow: on_message:` blocks with the same topic, should both fire, or should it be an error? The ESPHome convention for other trigger types is to allow multiple handlers. Unless there is a reason to deviate, both should fire.
+
+**Q7: Sending to an undeclared peer.**  
+If `espnow.send` is called with a peer that was not declared in the `espnow: peers:` list (e.g., via a dynamic MAC in a lambda), should the component auto-add the peer as unencrypted and attempt the send, or return an error? Auto-add is convenient but may surprise users who expect explicit peer declaration to be enforced. Explicit error is safer.
+
+**Q8: SoftAP mode.**  
+If the user runs the ESP8266 as a SoftAP (rather than STA), the device controls its own channel. Does the component need to handle this case differently? In SoftAP mode, `channel: 0` would resolve to the SoftAP channel, which the device itself set. This should work transparently, but it has not been verified.
+
+---
+
+## 9. Out of Scope for v1
+
+**Remote command abstraction (case 3).**  
+A dedicated `espnow_command:` declarative abstraction for unidirectional remote actuation. Not included because the flexible layer already covers this use case: send a payload with `espnow.send`, receive it with `on_message`, execute an action. Adding a declarative wrapper for this pattern provides marginal value and would need to be designed carefully to avoid duplicating ESPHome's existing action system. Deferred until there is concrete demand.
+
+**Broadcast / pub-sub abstraction (case 4).**  
+A higher-level pub-sub system where publishers don't maintain explicit peer lists. The primitive `espnow.send` already supports `peer: broadcast`. A declarative pub-sub layer would need to define subscription semantics, which implies a non-trivial design effort. Deferred.
+
+**Mesh repeater (case 5).**  
+Frame forwarding to extend range. This requires the component to make routing decisions, maintain forwarding tables, and avoid loops. Fundamentally different in complexity from a flat peer model. Out of scope for this component as currently conceived — a mesh use case would likely warrant a separate component.
+
+**Heartbeat and liveness detection.**  
+Section 6.3 demonstrates that this is fully implementable using v1 primitives plus `interval:` and `script:`. Native support would add complexity for no functional gain. Out of scope by the "minimal logic in firmware" principle.
+
+**Re-sync on reconnect.**  
+Same argument as heartbeat: expressible via `on_boot:` and `espnow.send`. Out of scope.
+
+**Conflict resolution beyond last-write-wins.**  
+For the target use case (physical switch presses in a residential environment), simultaneous conflicting writes are not a realistic concern. CRDT-style or timestamp-based resolution would add firmware complexity with no practical benefit for the intended deployment context.
+
+**ESP32 support.**  
+ESPHome's official ESP-NOW component covers ESP32. This component targets the gap: ESP8266 and ESP8285 devices that the official component cannot serve.
+
+**Non-Arduino framework.**  
+ESPHome only supports the Arduino framework for ESP8266. There is no RTOS SDK / IDF path available. Out of scope by constraint.
+
+---
+
+## 10. References
+
+[^1]: Espressif. *ESP-NOW — ESP-IDF Programming Guide (ESP32)*. https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/network/esp_now.html  
+[^2]: Espressif. *ESP8266 RTOS SDK — `esp_now.h`*. https://github.com/espressif/ESP8266_RTOS_SDK/blob/master/components/esp8266/include/esp_now.h  
+[^3]: Espressif. *ESP-IDF — `esp_now.h`*. https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_now.h  
