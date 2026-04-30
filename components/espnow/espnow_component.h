@@ -246,4 +246,127 @@ class DeletePeerAction : public Action<Ts...>, public Parented<ESPNowComponent> 
 }  // namespace espnow
 }  // namespace esphome
 
+// ── Declarative layer: switch sync ───────────────────────────────────────────
+// Included only when the switch component is compiled into the build.
+
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+
+namespace esphome {
+namespace espnow {
+
+/// Binds an ESPHome switch to a set of ESP-NOW peers for symmetric state sync.
+///
+/// On construction, registers an on_state_callback on the switch that sends the
+/// new state (0x01 = on, 0x00 = off) to every peer.  As an ESPNowReceivePacketHandler,
+/// it receives incoming state frames from those same peers and applies them locally
+/// without re-transmitting — avoiding feedback loops.
+///
+/// Expands the declarative espnow: sync_switches: abstraction from the design doc §6.2.
+class SwitchSyncGroup : public ESPNowReceivePacketHandler {
+ public:
+  SwitchSyncGroup(ESPNowComponent *espnow, switch_::Switch *sw) : espnow_(espnow), sw_(sw) {
+    sw->add_on_state_callback([this](bool state) {
+      uint8_t payload = state ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+      for (uint8_t i = 0; i < peer_count_; i++) {
+        espnow_->send(peers_[i], &payload, 1, nullptr);
+      }
+    });
+  }
+
+  void add_peer(peer_address_t peer) {
+    if (peer_count_ < ESPNOW_MAX_TOTAL_PEER_NUM) {
+      memcpy(peers_[peer_count_++], peer.data(), 6);
+    }
+  }
+
+  bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    for (uint8_t i = 0; i < peer_count_; i++) {
+      if (memcmp(info.src_addr, peers_[i], 6) == 0) {
+        if (size >= 1) {
+          if (data[0] != 0) sw_->turn_on();
+          else sw_->turn_off();
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+ protected:
+  ESPNowComponent *espnow_;
+  switch_::Switch *sw_;
+  uint8_t peers_[ESPNOW_MAX_TOTAL_PEER_NUM][6]{};
+  uint8_t peer_count_{0};
+};
+
+}  // namespace espnow
+}  // namespace esphome
+#endif  // USE_SWITCH
+
+// ── Declarative layer: sensor publish / receive ───────────────────────────────
+// Included only when the sensor component is compiled into the build.
+
+#ifdef USE_SENSOR
+#include "esphome/components/sensor/sensor.h"
+
+namespace esphome {
+namespace espnow {
+
+/// Receive-side sensor for the declarative espnow: telemetry abstraction.
+///
+/// Registers itself as a receive handler with the ESP-NOW component.  When a
+/// frame arrives from the configured source peer, decodes the 4-byte IEEE 754
+/// float payload and calls publish_state().  Only frames from source_ are
+/// accepted; frames from other peers are passed through (return false).
+///
+/// The float encoding is the same one espnow_publish uses on the sender side,
+/// making the pairing symmetric without user-visible encoding details.
+class ESPNowSensor : public sensor::Sensor, public ESPNowReceivePacketHandler {
+ public:
+  ESPNowSensor(ESPNowComponent *espnow, peer_address_t source) {
+    memcpy(source_, source.data(), 6);
+    espnow->register_receive_handler(this);
+  }
+
+  bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    if (memcmp(info.src_addr, source_, 6) != 0)
+      return false;
+    if (size != sizeof(float))
+      return false;
+    float value;
+    memcpy(&value, data, sizeof(float));
+    this->publish_state(value);
+    return false;
+  }
+
+ protected:
+  uint8_t source_[6]{};
+};
+
+/// Sender-side helper for espnow_publish sensor mixin.
+///
+/// Wraps the send call so it can be registered as an on_state_callback without
+/// requiring a lambda in the generated code.
+class SensorPublishHandler {
+ public:
+  SensorPublishHandler(ESPNowComponent *espnow, peer_address_t peer) : espnow_(espnow) {
+    memcpy(peer_, peer.data(), 6);
+  }
+
+  void on_value(float value) {
+    uint8_t buf[sizeof(float)];
+    memcpy(buf, &value, sizeof(float));
+    espnow_->send(peer_, buf, sizeof(float), nullptr);
+  }
+
+ protected:
+  ESPNowComponent *espnow_;
+  uint8_t peer_[6]{};
+};
+
+}  // namespace espnow
+}  // namespace esphome
+#endif  // USE_SENSOR
+
 #endif  // USE_ESP8266

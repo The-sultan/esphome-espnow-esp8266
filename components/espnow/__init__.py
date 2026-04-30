@@ -1,6 +1,8 @@
 from esphome import automation, core
 import esphome.codegen as cg
 from esphome.components import wifi
+from esphome.components import switch as esphome_switch
+from esphome.components import sensor as esphome_sensor
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ADDRESS,
@@ -61,6 +63,8 @@ CONF_ON_BROADCAST = "on_broadcast"
 CONF_ON_UNKNOWN_PEER = "on_unknown_peer"
 CONF_WAIT_FOR_SENT = "wait_for_sent"
 CONF_CONTINUE_ON_ERROR = "continue_on_error"
+CONF_SYNC_SWITCHES = "sync_switches"
+CONF_PUBLISH_SENSORS = "publish_sensors"
 
 MAX_ESPNOW_PACKET_SIZE = 250
 MAX_LMK_PMK_SIZE = 16
@@ -161,6 +165,22 @@ CONFIG_SCHEMA = cv.All(
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnUnknownPeerTrigger),
                 },
                 single=True,
+            ),
+            cv.Optional(CONF_SYNC_SWITCHES): cv.ensure_list(
+                cv.Schema(
+                    {
+                        cv.Required("switch_id"): cv.use_id(esphome_switch.Switch),
+                        cv.Required(CONF_PEERS): cv.ensure_list(_validate_peer_ref),
+                    }
+                )
+            ),
+            cv.Optional(CONF_PUBLISH_SENSORS): cv.ensure_list(
+                cv.Schema(
+                    {
+                        cv.Required("sensor_id"): cv.use_id(esphome_sensor.Sensor),
+                        cv.Required("peer"): _validate_peer_ref,
+                    }
+                )
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -271,6 +291,16 @@ async def to_code(config):
             on_unknown,
         )
         cg.add(var.register_unknown_peer_handler(trigger))
+
+    # ── Declarative layer ──────────────────────────────────────────────────────
+
+    if sync_sw := config.get(CONF_SYNC_SWITCHES):
+        from .switch import sync_switches_to_code
+        await sync_switches_to_code(var, sync_sw)
+
+    if pub_sen := config.get(CONF_PUBLISH_SENSORS):
+        from .sensor import publish_sensors_to_code
+        await publish_sensors_to_code(var, pub_sen)
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
