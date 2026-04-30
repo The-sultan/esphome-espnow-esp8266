@@ -11,8 +11,7 @@
 #include <vector>
 
 extern "C" {
-#include "esp_now.h"
-#include "esp_wifi.h"
+#include <espnow.h>
 }
 
 namespace esphome {
@@ -23,11 +22,12 @@ static const uint8_t ESPNOW_MAX_TOTAL_PEER_NUM = 20;
 static const uint8_t ESPNOW_QUEUE_SIZE = 8;
 
 using peer_address_t = std::array<uint8_t, 6>;
-using send_callback_t = std::function<void(esp_err_t)>;
+// Callback receives 0 on success, non-zero on failure (matches ESP_OK/ESP_FAIL).
+using send_callback_t = std::function<void(int)>;
 
 /// Received frame metadata.
 /// On ESP8266, only src_addr is available — the receive callback does not expose
-/// des_addr (ESP8266 RTOS SDK limitation, see design doc §2.5 and §4 divergences).
+/// des_addr (ESP8266 non-OS SDK limitation, see design doc §2.5 and §4 divergences).
 struct ESPNowRecvInfo {
   uint8_t src_addr[6];
 };
@@ -45,7 +45,7 @@ struct ESPNowQueueEntry {
   uint8_t size;
 };
 
-// ── Handler interfaces (matching official ESP-NOW component naming) ────────────
+// ── Handler interfaces ────────────────────────────────────────────────────────
 
 class ESPNowReceivePacketHandler {
  public:
@@ -72,29 +72,30 @@ class ESPNowComponent : public Component {
   float get_setup_priority() const override { return setup_priority::LATE; }
 
   void set_channel(uint8_t channel) { channel_ = channel; }
-  void set_pmk(const std::vector<uint8_t> &pmk);
+  void set_pmk(const std::array<uint8_t, 16> &pmk);
   void set_auto_add_peer(bool v) { auto_add_peer_ = v; }
 
   void add_static_peer(peer_address_t mac, uint8_t channel);
   void add_static_peer_with_lmk(peer_address_t mac, uint8_t channel, std::array<uint8_t, 16> lmk);
 
-  esp_err_t add_peer(const uint8_t *mac);
-  esp_err_t del_peer(const uint8_t *mac);
+  int add_peer(const uint8_t *mac);
+  int del_peer(const uint8_t *mac);
 
-  esp_err_t send(const uint8_t *peer, const std::vector<uint8_t> &data,
-                 const send_callback_t &callback = nullptr) {
+  int send(const uint8_t *peer, const std::vector<uint8_t> &data,
+           const send_callback_t &callback = nullptr) {
     return this->send(peer, data.data(), data.size(), callback);
   }
-  esp_err_t send(const uint8_t *peer, const uint8_t *data, size_t size,
-                 const send_callback_t &callback = nullptr);
+  int send(const uint8_t *peer, const uint8_t *data, size_t size,
+           const send_callback_t &callback = nullptr);
 
   void register_receive_handler(ESPNowReceivePacketHandler *h) { receive_handlers_.push_back(h); }
   void register_broadcast_handler(ESPNowBroadcastHandler *h) { broadcast_handlers_.push_back(h); }
   void register_unknown_peer_handler(ESPNowUnknownPeerHandler *h) { unknown_peer_handlers_.push_back(h); }
 
  protected:
-  static void recv_cb_(const uint8_t *mac, const uint8_t *data, int len);
-  static void send_cb_(const uint8_t *mac, esp_now_send_status_t status);
+  // ESP8266 SDK callback signatures: non-const pointers, uint8_t len.
+  static void recv_cb_(uint8_t *mac, uint8_t *data, uint8_t len);
+  static void send_cb_(uint8_t *mac, uint8_t status);
   void dispatch_(const ESPNowQueueEntry &entry);
 
   uint8_t channel_{0};
@@ -106,14 +107,13 @@ class ESPNowComponent : public Component {
   uint8_t static_peer_count_{0};
 
   // Single-producer (WiFi task) / single-consumer (loop) ring buffer.
-  // write_ advanced only by recv_cb_, read_ only by loop() — lock-free on single core.
   static ESPNowQueueEntry recv_queue_[ESPNOW_QUEUE_SIZE];
   static volatile uint8_t recv_queue_write_;
   uint8_t recv_queue_read_{0};
 
   // Send callback deferred to loop() — WiFi task sets the flag, loop() invokes the fn.
   static volatile bool send_cb_fired_;
-  static volatile esp_now_send_status_t send_cb_status_;
+  static volatile uint8_t send_cb_status_;
   send_callback_t pending_send_cb_{nullptr};
 
   std::vector<ESPNowReceivePacketHandler *> receive_handlers_;
@@ -192,8 +192,8 @@ class SendAction : public Action<Ts...>, public Parented<ESPNowComponent> {
     bool wait = wait_for_sent_;
     bool cont = continue_on_error_;
 
-    send_callback_t cb = [this, wait, cont, x...](esp_err_t status) {
-      if (status == ESP_OK) {
+    send_callback_t cb = [this, wait, cont, x...](int status) {
+      if (status == 0) {
         if (wait)
           this->play_next_(x...);
       } else {
@@ -206,8 +206,8 @@ class SendAction : public Action<Ts...>, public Parented<ESPNowComponent> {
       }
     };
 
-    esp_err_t err = this->parent_->send(address.data(), data, cb);
-    if (err != ESP_OK) {
+    int err = this->parent_->send(address.data(), data, cb);
+    if (err != 0) {
       cb(err);
     } else if (!wait) {
       this->play_next_(x...);
@@ -247,7 +247,6 @@ class DeletePeerAction : public Action<Ts...>, public Parented<ESPNowComponent> 
 }  // namespace esphome
 
 // ── Declarative layer: switch sync ───────────────────────────────────────────
-// Included only when the switch component is compiled into the build.
 
 #ifdef USE_SWITCH
 #include "esphome/components/switch/switch.h"
@@ -255,14 +254,6 @@ class DeletePeerAction : public Action<Ts...>, public Parented<ESPNowComponent> 
 namespace esphome {
 namespace espnow {
 
-/// Binds an ESPHome switch to a set of ESP-NOW peers for symmetric state sync.
-///
-/// On construction, registers an on_state_callback on the switch that sends the
-/// new state (0x01 = on, 0x00 = off) to every peer.  As an ESPNowReceivePacketHandler,
-/// it receives incoming state frames from those same peers and applies them locally
-/// without re-transmitting — avoiding feedback loops.
-///
-/// Expands the declarative espnow: sync_switches: abstraction from the design doc §6.2.
 class SwitchSyncGroup : public ESPNowReceivePacketHandler {
  public:
   SwitchSyncGroup(ESPNowComponent *espnow, switch_::Switch *sw) : espnow_(espnow), sw_(sw) {
@@ -305,7 +296,6 @@ class SwitchSyncGroup : public ESPNowReceivePacketHandler {
 #endif  // USE_SWITCH
 
 // ── Declarative layer: sensor publish / receive ───────────────────────────────
-// Included only when the sensor component is compiled into the build.
 
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
@@ -313,15 +303,6 @@ class SwitchSyncGroup : public ESPNowReceivePacketHandler {
 namespace esphome {
 namespace espnow {
 
-/// Receive-side sensor for the declarative espnow: telemetry abstraction.
-///
-/// Registers itself as a receive handler with the ESP-NOW component.  When a
-/// frame arrives from the configured source peer, decodes the 4-byte IEEE 754
-/// float payload and calls publish_state().  Only frames from source_ are
-/// accepted; frames from other peers are passed through (return false).
-///
-/// The float encoding is the same one espnow_publish uses on the sender side,
-/// making the pairing symmetric without user-visible encoding details.
 class ESPNowSensor : public sensor::Sensor, public ESPNowReceivePacketHandler {
  public:
   ESPNowSensor(ESPNowComponent *espnow, peer_address_t source) {
@@ -344,18 +325,12 @@ class ESPNowSensor : public sensor::Sensor, public ESPNowReceivePacketHandler {
   uint8_t source_[6]{};
 };
 
-/// Sender-side helper for espnow_publish sensor mixin.
-///
-/// Wraps the send call so it can be registered as an on_state_callback without
-/// requiring a lambda in the generated code.
 class SensorPublishHandler {
  public:
   SensorPublishHandler(ESPNowComponent *espnow, peer_address_t peer) : espnow_(espnow) {
     memcpy(peer_, peer.data(), 6);
   }
 
-  /// Register this handler as a state callback on the given sensor.
-  /// Avoids lambdas in the generated code — called once from setup().
   void register_with(sensor::Sensor *sensor) {
     sensor->add_on_state_callback([this](float value) {
       uint8_t buf[sizeof(float)];

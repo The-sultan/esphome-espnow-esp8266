@@ -151,13 +151,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_RECEIVE): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnReceiveTrigger),
-                    cv.Optional(CONF_ADDRESS): cv.mac_address,
+                    cv.Optional(CONF_ADDRESS): _validate_peer_ref,
                 }
             ),
             cv.Optional(CONF_ON_BROADCAST): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnBroadcastTrigger),
-                    cv.Optional(CONF_ADDRESS): cv.mac_address,
+                    cv.Optional(CONF_ADDRESS): _validate_peer_ref,
                 }
             ),
             cv.Optional(CONF_ON_UNKNOWN_PEER): automation.validate_automation(
@@ -197,7 +197,13 @@ def _mac_to_array(mac_parts):
 async def _trigger_to_code(config, trigger_id_key):
     args = []
     if address := config.get(CONF_ADDRESS):
-        args.append(_mac_to_array(address.parts))
+        if isinstance(address, str):
+            if address not in _PEER_MAP:
+                raise cv.Invalid(f"Unknown peer id '{address}'")
+            parts = _PEER_MAP[address]
+        else:
+            parts = address.parts
+        args.append(_mac_to_array(parts))
     return cg.new_Pvariable(config[trigger_id_key], *args)
 
 
