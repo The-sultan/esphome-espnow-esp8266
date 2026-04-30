@@ -1,0 +1,79 @@
+# ESP-NOW switch sync — Node B
+#
+# Symmetric to node_a.yaml. Replace PEER_MAC_A with Node A's actual MAC.
+# See node_a.yaml header for full setup instructions.
+
+substitutions:
+  device_name: espnow-node-b
+  peer_mac_a: "AA:BB:CC:DD:EE:01"   # ← replace with Node A's MAC
+
+esphome:
+  name: ${device_name}
+
+esp8266:
+  board: nodemcuv2          # ← change for your hardware
+  framework:
+    type: arduino
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [espnow]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} AP"
+
+captive_portal:
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ── ESP-NOW ────────────────────────────────────────────────────────────────────
+
+espnow:
+  channel: 0
+  peers:
+    - mac: ${peer_mac_a}
+      id: node_a
+  on_receive:
+    address: node_a
+    then:
+      - if:
+          condition:
+            lambda: "return data[0] != 0;"
+          then:
+            - switch.turn_on: my_switch
+          else:
+            - switch.turn_off: my_switch
+
+# ── Switch ─────────────────────────────────────────────────────────────────────
+
+switch:
+  - platform: template
+    name: "Node B switch"
+    id: my_switch
+    optimistic: true
+    on_turn_on:
+      - logger.log: "B: turned ON — sending to A"
+      - espnow.send:
+          peer: node_a
+          payload: [0x01]
+          wait_for_sent: false
+    on_turn_off:
+      - logger.log: "B: turned OFF — sending to A"
+      - espnow.send:
+          peer: node_a
+          payload: [0x00]
+          wait_for_sent: false
