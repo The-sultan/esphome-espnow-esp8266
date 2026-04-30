@@ -1,7 +1,7 @@
 # ESP-NOW External Component for ESP8266 — Design Document
 
-**Version:** 0.3  
-**Status:** Draft — open for discussion
+**Version:** 1.0  
+**Status:** v1.0 — ready for implementation
 
 ---
 
