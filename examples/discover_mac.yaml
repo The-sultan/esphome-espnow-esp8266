@@ -17,8 +17,6 @@ esphome:
 
 esp8266:
   board: nodemcuv2          # ← change for your hardware
-  framework:
-    type: arduino
 
 wifi:
   ssid: !secret wifi_ssid
@@ -32,9 +30,6 @@ logger:
   level: INFO
 
 api:
-  encryption:
-    key: !secret api_key
 
 ota:
   - platform: esphome
-    password: !secret ota_password

@@ -5,15 +5,13 @@
 
 substitutions:
   device_name: espnow-node-b
-  peer_mac_a: "AA:BB:CC:DD:EE:01"   # ← replace with Node A's MAC
+  peer_mac_a: "XX:XX:XX:XX:XX:XX"   # ← replace with Node A's actual MAC
 
 esphome:
   name: ${device_name}
 
 esp8266:
   board: nodemcuv2          # ← change for your hardware
-  framework:
-    type: arduino
 
 external_components:
   - source:
@@ -33,17 +31,13 @@ logger:
   level: DEBUG
 
 api:
-  encryption:
-    key: !secret api_key
 
 ota:
   - platform: esphome
-    password: !secret ota_password
 
 # ── ESP-NOW ────────────────────────────────────────────────────────────────────
 
 espnow:
-  channel: 0
   peers:
     - mac: ${peer_mac_a}
       id: node_a
@@ -68,12 +62,12 @@ switch:
     on_turn_on:
       - logger.log: "B: turned ON — sending to A"
       - espnow.send:
-          peer: node_a
-          payload: [0x01]
+          address: node_a
+          data: [0x01]
           wait_for_sent: false
     on_turn_off:
       - logger.log: "B: turned OFF — sending to A"
       - espnow.send:
-          peer: node_a
-          payload: [0x00]
+          address: node_a
+          data: [0x00]
           wait_for_sent: false

@@ -16,15 +16,13 @@
 
 substitutions:
   device_name: espnow-node-a
-  peer_mac_b: "AA:BB:CC:DD:EE:02"   # ← replace with Node B's MAC
+  peer_mac_b: "XX:XX:XX:XX:XX:XX"   # ← replace with Node B's actual MAC
 
 esphome:
   name: ${device_name}
 
 esp8266:
   board: nodemcuv2          # ← change for your hardware
-  framework:
-    type: arduino
 
 external_components:
   - source:
@@ -44,17 +42,13 @@ logger:
   level: DEBUG              # DEBUG shows ESP-NOW TX/RX in the log
 
 api:
-  encryption:
-    key: !secret api_key
 
 ota:
   - platform: esphome
-    password: !secret ota_password
 
 # ── ESP-NOW ────────────────────────────────────────────────────────────────────
 
 espnow:
-  channel: 0                # inherit channel from wifi: (correct for STA mode)
   peers:
     - mac: ${peer_mac_b}
       id: node_b
@@ -82,14 +76,14 @@ switch:
     on_turn_on:
       - logger.log: "A: turned ON — sending to B"
       - espnow.send:
-          peer: node_b
-          payload: [0x01]
+          address: node_b
+          data: [0x01]
           wait_for_sent: false
     on_turn_off:
       - logger.log: "A: turned OFF — sending to B"
       - espnow.send:
-          peer: node_b
-          payload: [0x00]
+          address: node_b
+          data: [0x00]
           wait_for_sent: false
 
 # Uncomment to use a physical GPIO switch (Sonoff TX):
@@ -100,11 +94,11 @@ switch:
 #     id: my_switch
 #     on_turn_on:
 #       - espnow.send:
-#           peer: node_b
-#           payload: [0x01]
+#           address: node_b
+#           data: [0x01]
 #           wait_for_sent: false
 #     on_turn_off:
 #       - espnow.send:
-#           peer: node_b
-#           payload: [0x00]
+#           address: node_b
+#           data: [0x00]
 #           wait_for_sent: false
