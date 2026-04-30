@@ -12,6 +12,7 @@ build/
 # ESPHome
 .esphome/
 secrets.yaml
+examples/secrets.yaml
 
 # C/C++ build artifacts
 *.o

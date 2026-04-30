@@ -83,16 +83,7 @@ async def publish_sensors_to_code(espnow_var, publish_list):
         handler = cg.new_Pvariable(
             cg.new_id(SensorPublishHandler), SensorPublishHandler, espnow_var, mac_arr
         )
-        # Wire: sensor_var->add_on_state_callback([handler](float v) { handler->on_value(v); })
-        # Using a LambdaAction-equivalent: ESPHome sensor's add_on_state_callback accepts
-        # std::function<void(float)>. We bind the handler's method via a capturing lambda
-        # in the generated C++ (generated lambdas are acceptable; YAML lambdas are not).
-        cg.add(
-            cg.RawExpression(
-                f"{sensor_var}->add_on_state_callback("
-                f"[{handler}](float v) {{ {handler}->on_value(v); }})"
-            )
-        )
+        cg.add(handler.register_with(sensor_var))
 
 
 # ── platform: espnow sensor (receiver) ───────────────────────────────────────

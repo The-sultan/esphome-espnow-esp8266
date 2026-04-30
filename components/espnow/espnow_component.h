@@ -354,10 +354,14 @@ class SensorPublishHandler {
     memcpy(peer_, peer.data(), 6);
   }
 
-  void on_value(float value) {
-    uint8_t buf[sizeof(float)];
-    memcpy(buf, &value, sizeof(float));
-    espnow_->send(peer_, buf, sizeof(float), nullptr);
+  /// Register this handler as a state callback on the given sensor.
+  /// Avoids lambdas in the generated code — called once from setup().
+  void register_with(sensor::Sensor *sensor) {
+    sensor->add_on_state_callback([this](float value) {
+      uint8_t buf[sizeof(float)];
+      memcpy(buf, &value, sizeof(float));
+      espnow_->send(peer_, buf, sizeof(float), nullptr);
+    });
   }
 
  protected:
