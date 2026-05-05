@@ -2,6 +2,7 @@
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
+#include "esphome/core/log.h"
 
 #ifdef USE_ESP8266
 
@@ -134,8 +135,11 @@ class OnReceiveTrigger : public Trigger<const ESPNowRecvInfo &, const uint8_t *,
   explicit OnReceiveTrigger() {}
 
   bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
-    if (has_address_ && memcmp(address_, info.src_addr, 6) != 0)
+    if (has_address_ && memcmp(address_, info.src_addr, 6) != 0) {
+      ESP_LOGD("espnow", "  OnReceiveTrigger: addr mismatch, skipping");
       return false;
+    }
+    ESP_LOGD("espnow", "  OnReceiveTrigger: FIRING trigger");
     this->trigger(info, data, size);
     return false;
   }

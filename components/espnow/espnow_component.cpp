@@ -208,11 +208,18 @@ int ESPNowComponent::send(const uint8_t *peer, const uint8_t *data, size_t size,
 void ESPNowComponent::dispatch_(const ESPNowQueueEntry &entry) {
   const uint8_t *src = entry.info.src_addr;
 
-  ESP_LOGD(TAG, "RX from %02X:%02X:%02X:%02X:%02X:%02X len=%u",
-           src[0], src[1], src[2], src[3], src[4], src[5], entry.size);
+  ESP_LOGD(TAG, "RX from %02X:%02X:%02X:%02X:%02X:%02X len=%u data[0]=%02X data[1]=%02X",
+           src[0], src[1], src[2], src[3], src[4], src[5], entry.size,
+           entry.size > 0 ? entry.data[0] : 0,
+           entry.size > 1 ? entry.data[1] : 0);
 
-  if (esp_now_is_peer_exist(const_cast<uint8_t *>(src))) {
+  bool peer_known = esp_now_is_peer_exist(const_cast<uint8_t *>(src));
+  ESP_LOGD(TAG, "  peer_known=%d receive_handlers=%u broadcast_handlers=%u",
+           (int) peer_known, (unsigned) receive_handlers_.size(), (unsigned) broadcast_handlers_.size());
+
+  if (peer_known) {
     for (auto *h : receive_handlers_) {
+      ESP_LOGD(TAG, "  calling receive_handler");
       if (h->on_receive(entry.info, entry.data, entry.size))
         break;
     }
