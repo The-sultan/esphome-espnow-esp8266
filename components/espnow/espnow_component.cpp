@@ -88,6 +88,7 @@ void ESPNowComponent::loop() {
     send_cb_fired_ = false;
     auto cb = pending_send_cb_;
     pending_send_cb_ = nullptr;
+    ESP_LOGD(TAG, "TX ack: %s", send_cb_status_ == 0 ? "OK" : "FAIL");
     cb(send_cb_status_ == 0 ? 0 : -1);  // 0 = ESP_NOW_SEND_SUCCESS on ESP8266
   }
 }
